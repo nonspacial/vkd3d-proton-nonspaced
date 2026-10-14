@@ -784,20 +784,162 @@ static HRESULT dxgi_vk_swap_chain_allocate_user_buffer(struct dxgi_vk_swap_chain
             D3D12_RESOURCE_STATE_PRESENT, NULL, 0, NULL, NULL, ppResource);
 }
 
-static void dxgi_vk_swap_chain_enqueue_user_buffer_transitions(struct dxgi_vk_swap_chain *chain)
+static void dxgi_vk_swap_chain_init_user_buffer_layouts(struct dxgi_vk_swap_chain *chain)
 {
+    const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
+    VkImageMemoryBarrier2 clear_barriers[DXGI_MAX_SWAP_CHAIN_BUFFERS];
+    VkImageMemoryBarrier2 barriers[DXGI_MAX_SWAP_CHAIN_BUFFERS];
+    struct d3d12_resource *resources[DXGI_MAX_SWAP_CHAIN_BUFFERS];
+    VkDevice vk_device = chain->queue->device->vk_device;
+    VkCommandPoolCreateInfo command_pool_create_info;
+    VkCommandBufferAllocateInfo allocate_info;
+    VkCommandBufferSubmitInfo cmd_buffer_info;
+    VkCommandBufferBeginInfo cmd_begin_info;
+    unsigned int count = 0, clear_count = 0;
+    VkCommandPool vk_pool = VK_NULL_HANDLE;
+    VkImageSubresourceRange clear_range;
+    VkFence vk_fence = VK_NULL_HANDLE;
+    VkClearColorValue clear_value;
+    VkFenceCreateInfo fence_info;
+    struct d3d12_resource *resource;
+    VkSubmitInfo2 submit_info;
+    VkDependencyInfo dep_info;
+    VkCommandBuffer vk_cmd;
+    VkQueue vk_queue;
     unsigned int i;
+    VkResult vr;
 
     /* A user buffer keeps initial_layout_transition set until a D3D12 submission first uses it,
      * and record_render_pass() blanks every present of such a buffer. D3D11On12 (DXVK interop)
-     * renders into the buffers through the raw VkQueue, which never clears the flag, so a title
-     * that draws its frames only through 11on12 would present black forever. Do the initial
-     * transition up front on the present queue, as the first D3D12 use would.
-     * Queued only once the chain is fully set up, so no failure path frees a buffer that a
-     * pending transition still references. */
+     * renders into the buffers through the raw VkQueue, which never clears the flag (nor does the
+     * transition), so a title that draws its frames only through 11on12 would present black forever.
+     * Do the initial transition here instead, on the swapchain's own command buffer, submitted
+     * straight to the present VkQueue and waited for before returning: the buffers are new and have
+     * no D3D12 work yet, so nothing has to go through the D3D12 queue (whose submission thread may be
+     * blocked on an application fence wait), and no transition is ever pending when the next
+     * ChangeProperties() or the destructor frees the buffers.
+     * A committed back buffer is zero-initialised on Windows, so a buffer presented before it is
+     * rendered to shows black; clear it to zero unless the memory is already zero-initialised. */
     for (i = 0; i < chain->desc.BufferCount; i++)
-        vkd3d_enqueue_initial_transition(&chain->queue->ID3D12CommandQueue_iface,
-                (ID3D12Resource *)&chain->user.backbuffers[i]->ID3D12Resource_iface);
+    {
+        resource = chain->user.backbuffers[i];
+        if (!vkd3d_atomic_uint32_exchange_explicit(&resource->initial_layout_transition, 0, vkd3d_memory_order_relaxed))
+            continue;
+
+        if (!vk_image_memory_barrier_for_initial_transition(resource, &barriers[count]))
+        {
+            vkd3d_atomic_uint32_store_explicit(&resource->initial_layout_transition, 1, vkd3d_memory_order_relaxed);
+            continue;
+        }
+
+        barriers[count].dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        barriers[count].dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+
+        if (!(resource->flags & VKD3D_RESOURCE_ZERO_INITIALIZED) &&
+                (resource->format->vk_format_features & VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT))
+        {
+            clear_barriers[clear_count] = barriers[count];
+            clear_barriers[clear_count].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            clear_barriers[clear_count].dstStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+            clear_barriers[clear_count].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            clear_count++;
+
+            barriers[count].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            barriers[count].srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+            barriers[count].srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        }
+
+        resources[count++] = resource;
+    }
+
+    if (!count)
+        return;
+
+    memset(&command_pool_create_info, 0, sizeof(command_pool_create_info));
+    command_pool_create_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    command_pool_create_info.queueFamilyIndex = chain->queue->vkd3d_queue->vk_family_index;
+    command_pool_create_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    if ((vr = VK_CALL(vkCreateCommandPool(vk_device, &command_pool_create_info, NULL, &vk_pool))) < 0)
+        goto fail;
+
+    memset(&allocate_info, 0, sizeof(allocate_info));
+    allocate_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocate_info.commandPool = vk_pool;
+    allocate_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocate_info.commandBufferCount = 1;
+    if ((vr = VK_CALL(vkAllocateCommandBuffers(vk_device, &allocate_info, &vk_cmd))) < 0)
+        goto fail;
+
+    memset(&fence_info, 0, sizeof(fence_info));
+    fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    if ((vr = VK_CALL(vkCreateFence(vk_device, &fence_info, NULL, &vk_fence))) < 0)
+        goto fail;
+
+    memset(&cmd_begin_info, 0, sizeof(cmd_begin_info));
+    cmd_begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    cmd_begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if ((vr = VK_CALL(vkBeginCommandBuffer(vk_cmd, &cmd_begin_info))) < 0)
+        goto fail;
+
+    memset(&dep_info, 0, sizeof(dep_info));
+    dep_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+
+    if (clear_count)
+    {
+        dep_info.imageMemoryBarrierCount = clear_count;
+        dep_info.pImageMemoryBarriers = clear_barriers;
+        VK_CALL(vkCmdPipelineBarrier2(vk_cmd, &dep_info));
+
+        memset(&clear_value, 0, sizeof(clear_value));
+        for (i = 0; i < clear_count; i++)
+        {
+            clear_range = clear_barriers[i].subresourceRange;
+            VK_CALL(vkCmdClearColorImage(vk_cmd, clear_barriers[i].image,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear_value, 1, &clear_range));
+        }
+    }
+
+    dep_info.imageMemoryBarrierCount = count;
+    dep_info.pImageMemoryBarriers = barriers;
+    VK_CALL(vkCmdPipelineBarrier2(vk_cmd, &dep_info));
+
+    if ((vr = VK_CALL(vkEndCommandBuffer(vk_cmd))) < 0)
+        goto fail;
+
+    memset(&cmd_buffer_info, 0, sizeof(cmd_buffer_info));
+    cmd_buffer_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+    cmd_buffer_info.commandBuffer = vk_cmd;
+
+    memset(&submit_info, 0, sizeof(submit_info));
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    submit_info.commandBufferInfoCount = 1;
+    submit_info.pCommandBufferInfos = &cmd_buffer_info;
+
+    if (!(vk_queue = vkd3d_queue_acquire(chain->queue->vkd3d_queue)))
+    {
+        vr = VK_ERROR_UNKNOWN;
+        goto fail;
+    }
+    vr = VK_CALL(vkQueueSubmit2(vk_queue, 1, &submit_info, vk_fence));
+    vkd3d_queue_release(chain->queue->vkd3d_queue);
+    VKD3D_DEVICE_REPORT_FAULT_AND_BREADCRUMB_IF(chain->queue->device, vr == VK_ERROR_DEVICE_LOST);
+    if (vr < 0)
+        goto fail;
+
+    if ((vr = VK_CALL(vkWaitForFences(vk_device, 1, &vk_fence, VK_TRUE, UINT64_MAX))))
+        ERR("Failed to wait for the user buffer transitions, vr %d.\n", vr);
+
+    VK_CALL(vkDestroyFence(vk_device, vk_fence, NULL));
+    VK_CALL(vkDestroyCommandPool(vk_device, vk_pool, NULL));
+    return;
+
+fail:
+    /* Leave the buffers to the first D3D12 use, as before. */
+    ERR("Failed to transition the user buffers, vr %d.\n", vr);
+    for (i = 0; i < count; i++)
+        vkd3d_atomic_uint32_store_explicit(&resources[i]->initial_layout_transition, 1, vkd3d_memory_order_relaxed);
+    VK_CALL(vkDestroyFence(vk_device, vk_fence, NULL));
+    VK_CALL(vkDestroyCommandPool(vk_device, vk_pool, NULL));
 }
 
 static HRESULT dxgi_vk_swap_chain_reallocate_user_buffers(struct dxgi_vk_swap_chain *chain)
@@ -908,7 +1050,7 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_ChangeProperties(IDXGIVkSwap
         return hr;
     }
 
-    dxgi_vk_swap_chain_enqueue_user_buffer_transitions(chain);
+    dxgi_vk_swap_chain_init_user_buffer_layouts(chain);
 
     if (chain->user.index >= chain->desc.BufferCount)
     {
@@ -3991,7 +4133,7 @@ static HRESULT dxgi_vk_swap_chain_init(struct dxgi_vk_swap_chain *chain, IDXGIVk
     if (FAILED(hr = dxgi_vk_swap_chain_init_frame_rate_limiter(chain)))
         goto cleanup_low_latency;
 
-    dxgi_vk_swap_chain_enqueue_user_buffer_transitions(chain);
+    dxgi_vk_swap_chain_init_user_buffer_layouts(chain);
     ID3D12CommandQueue_AddRef(&queue->ID3D12CommandQueue_iface);
     return S_OK;
 
