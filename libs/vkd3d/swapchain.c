@@ -784,6 +784,22 @@ static HRESULT dxgi_vk_swap_chain_allocate_user_buffer(struct dxgi_vk_swap_chain
             D3D12_RESOURCE_STATE_PRESENT, NULL, 0, NULL, NULL, ppResource);
 }
 
+static void dxgi_vk_swap_chain_enqueue_user_buffer_transitions(struct dxgi_vk_swap_chain *chain)
+{
+    unsigned int i;
+
+    /* A user buffer keeps initial_layout_transition set until a D3D12 submission first uses it,
+     * and record_render_pass() blanks every present of such a buffer. D3D11On12 (DXVK interop)
+     * renders into the buffers through the raw VkQueue, which never clears the flag, so a title
+     * that draws its frames only through 11on12 would present black forever. Do the initial
+     * transition up front on the present queue, as the first D3D12 use would.
+     * Queued only once the chain is fully set up, so no failure path frees a buffer that a
+     * pending transition still references. */
+    for (i = 0; i < chain->desc.BufferCount; i++)
+        vkd3d_enqueue_initial_transition(&chain->queue->ID3D12CommandQueue_iface,
+                (ID3D12Resource *)&chain->user.backbuffers[i]->ID3D12Resource_iface);
+}
+
 static HRESULT dxgi_vk_swap_chain_reallocate_user_buffers(struct dxgi_vk_swap_chain *chain)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
@@ -891,6 +907,8 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_ChangeProperties(IDXGIVkSwap
         chain->desc = old_desc;
         return hr;
     }
+
+    dxgi_vk_swap_chain_enqueue_user_buffer_transitions(chain);
 
     if (chain->user.index >= chain->desc.BufferCount)
     {
@@ -3973,6 +3991,7 @@ static HRESULT dxgi_vk_swap_chain_init(struct dxgi_vk_swap_chain *chain, IDXGIVk
     if (FAILED(hr = dxgi_vk_swap_chain_init_frame_rate_limiter(chain)))
         goto cleanup_low_latency;
 
+    dxgi_vk_swap_chain_enqueue_user_buffer_transitions(chain);
     ID3D12CommandQueue_AddRef(&queue->ID3D12CommandQueue_iface);
     return S_OK;
 
