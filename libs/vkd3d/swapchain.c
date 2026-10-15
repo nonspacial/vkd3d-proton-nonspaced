@@ -823,10 +823,15 @@ static void dxgi_vk_swap_chain_init_user_buffer_layouts(struct dxgi_vk_swap_chai
      * ChangeProperties() or the destructor frees the buffers.
      * A committed back buffer is zero-initialised on Windows, so a buffer presented before it is
      * rendered to shows black; clear it to zero unless the memory is already zero-initialised.
-     * A small buffer (under VKD3D_VA_BLOCK_SIZE) is suballocated, and its zero-fill waits on the
-     * device's memory transfer queue, which only ExecuteCommandLists() or the interop lock flush;
-     * so flush it here and wait for it in this submission, or the fill could land after the
-     * transition (and the clear) and leave the image undefined. */
+     * A suballocated buffer's zero-fill waits on the device's memory transfer queue, which only
+     * ExecuteCommandLists() or the interop lock flush; so flush it here and wait for it in this
+     * submission, or the fill could land after the transition (and the clear) and leave the image
+     * undefined. Which buffers are suballocated depends on the driver: those under
+     * VKD3D_VA_BLOCK_SIZE (2 MiB) where it zero-clears new allocations, and those up to
+     * VKD3D_MEMORY_IMAGE_HEAP_SUBALLOCATE_THRESHOLD (8 MiB, a 1080p BGRA8 buffer) where it does not
+     * (vkd3d_driver_can_zero_clear_alloc()); the flush is done whatever the size.
+     * The transitions start at ALL_COMMANDS, so they are in an execution dependency chain with that
+     * semaphore wait (also ALL_COMMANDS), not only the clear. */
     for (i = 0; i < chain->desc.BufferCount; i++)
     {
         resource = chain->user.backbuffers[i];
@@ -839,6 +844,7 @@ static void dxgi_vk_swap_chain_init_user_buffer_layouts(struct dxgi_vk_swap_chai
             continue;
         }
 
+        barriers[count].srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
         barriers[count].dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
         barriers[count].dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
 
