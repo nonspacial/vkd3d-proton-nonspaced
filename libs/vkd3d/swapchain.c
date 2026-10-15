@@ -794,6 +794,7 @@ static void dxgi_vk_swap_chain_init_user_buffer_layouts(struct dxgi_vk_swap_chai
     VkCommandPoolCreateInfo command_pool_create_info;
     VkCommandBufferAllocateInfo allocate_info;
     VkCommandBufferSubmitInfo cmd_buffer_info;
+    VkSemaphoreSubmitInfo transfer_wait_info;
     VkCommandBufferBeginInfo cmd_begin_info;
     unsigned int count = 0, clear_count = 0;
     VkCommandPool vk_pool = VK_NULL_HANDLE;
@@ -805,9 +806,11 @@ static void dxgi_vk_swap_chain_init_user_buffer_layouts(struct dxgi_vk_swap_chai
     VkSubmitInfo2 submit_info;
     VkDependencyInfo dep_info;
     VkCommandBuffer vk_cmd;
+    uint64_t transfer_value;
     VkQueue vk_queue;
     unsigned int i;
     VkResult vr;
+    HRESULT hr;
 
     /* A user buffer keeps initial_layout_transition set until a D3D12 submission first uses it,
      * and record_render_pass() blanks every present of such a buffer. D3D11On12 (DXVK interop)
@@ -819,7 +822,11 @@ static void dxgi_vk_swap_chain_init_user_buffer_layouts(struct dxgi_vk_swap_chai
      * blocked on an application fence wait), and no transition is ever pending when the next
      * ChangeProperties() or the destructor frees the buffers.
      * A committed back buffer is zero-initialised on Windows, so a buffer presented before it is
-     * rendered to shows black; clear it to zero unless the memory is already zero-initialised. */
+     * rendered to shows black; clear it to zero unless the memory is already zero-initialised.
+     * A small buffer (under VKD3D_VA_BLOCK_SIZE) is suballocated, and its zero-fill waits on the
+     * device's memory transfer queue, which only ExecuteCommandLists() or the interop lock flush;
+     * so flush it here and wait for it in this submission, or the fill could land after the
+     * transition (and the clear) and leave the image undefined. */
     for (i = 0; i < chain->desc.BufferCount; i++)
     {
         resource = chain->user.backbuffers[i];
@@ -910,8 +917,24 @@ static void dxgi_vk_swap_chain_init_user_buffer_layouts(struct dxgi_vk_swap_chai
     cmd_buffer_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
     cmd_buffer_info.commandBuffer = vk_cmd;
 
+    /* Before taking the present queue's lock: the flush takes the transfer queue's, which may be
+     * the same VkQueue. */
+    memset(&transfer_wait_info, 0, sizeof(transfer_wait_info));
+    if (FAILED(hr = vkd3d_memory_transfer_queue_flush_for_external_submission(&chain->queue->device->memory_transfers,
+            &transfer_wait_info.semaphore, &transfer_value)))
+    {
+        ERR("Failed to flush the memory transfer queue, hr %#x.\n", hr);
+        vr = VK_ERROR_UNKNOWN;
+        goto fail;
+    }
+    transfer_wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+    transfer_wait_info.value = transfer_value;
+    transfer_wait_info.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+
     memset(&submit_info, 0, sizeof(submit_info));
     submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    submit_info.waitSemaphoreInfoCount = 1;
+    submit_info.pWaitSemaphoreInfos = &transfer_wait_info;
     submit_info.commandBufferInfoCount = 1;
     submit_info.pCommandBufferInfos = &cmd_buffer_info;
 

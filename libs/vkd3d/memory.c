@@ -488,6 +488,23 @@ HRESULT vkd3d_memory_transfer_queue_flush(struct vkd3d_memory_transfer_queue *qu
     return hr;
 }
 
+/* For work submitted straight to a VkQueue rather than through a D3D12 queue (the swapchain's
+ * own submissions), which never consumes the waits vkd3d_add_wait_to_all_queues() adds: flushes
+ * the pending transfers and returns the timeline semaphore and the value that covers every
+ * transfer submitted so far, for that submission to wait on. */
+HRESULT vkd3d_memory_transfer_queue_flush_for_external_submission(struct vkd3d_memory_transfer_queue *queue,
+        VkSemaphore *vk_semaphore, uint64_t *value)
+{
+    HRESULT hr;
+
+    pthread_mutex_lock(&queue->mutex);
+    hr = vkd3d_memory_transfer_queue_flush_locked(queue);
+    *vk_semaphore = queue->vk_semaphore;
+    *value = queue->next_signal_value - 1;
+    pthread_mutex_unlock(&queue->mutex);
+    return hr;
+}
+
 #define VKD3D_MEMORY_TRANSFER_QUEUE_MAX_PENDING_BYTES (256ull << 20) /* 256 MiB */
 
 static void vkd3d_memory_transfer_queue_execute_transfer_locked(struct vkd3d_memory_transfer_queue *queue,
